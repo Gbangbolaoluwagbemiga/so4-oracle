@@ -159,7 +159,7 @@ fn mock_rpc_integration_transaction_failure_detection() {
 #[test]
 fn mock_rpc_integration_verified_signature_keypair() {
     // Actually exercise signing and verification against a keypair
-    use ed25519_dalek::{Signature, Verifier};
+    use ed25519_dalek::Verifier;
 
     let private_key_hex = "1111111111111111111111111111111111111111111111111111111111111111";
     let network_passphrase = "Test SDF Network ; September 2015";
