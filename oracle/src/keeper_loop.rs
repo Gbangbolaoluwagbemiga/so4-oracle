@@ -1663,6 +1663,12 @@ async fn record_execution(
 mod tests {
     use super::*;
 
+    #[test]
+    fn post_set_prices_settle_stays_small_fraction_of_cycle_budget() {
+        // #956 — the settle delay must not eat a meaningful share of the cycle timeout.
+        assert!(POST_SET_PRICES_SETTLE_MS * 10 <= KEEPER_CYCLE_TIMEOUT_SECS * 1_000);
+    }
+
     // ── #719: the in-flight-key decision must not depend on message text ─────
 
     /// A poll timeout leaves the transaction's fate genuinely undecided, so the
