@@ -58,8 +58,11 @@ fn mock_rpc_integration_with_mocked_source_prices() {
     let prices = [45000i128, 45100, 44900];
 
     // Actually call aggregate_prices to compute confidence interval from multiple sources
-    let result =
-        oracle::prices::aggregate_prices(&prices, &["binance", "coinbase", "pyth"], 2, 1000);
+    let sources: Vec<String> = ["binance", "coinbase", "pyth"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let result = oracle::prices::aggregate_prices(&prices, &sources, 2, 1000);
 
     assert!(
         result.is_ok(),
@@ -68,11 +71,11 @@ fn mock_rpc_integration_with_mocked_source_prices() {
     let aggregated = result.unwrap();
 
     // Verify the aggregated price contains all input sources
-    assert_eq!(aggregated.used_sources.len(), 3);
+    assert_eq!(aggregated.sources_used.len(), 3);
 
     // Verify confidence interval was computed (min <= median <= max)
-    assert!(aggregated.price_props.min <= aggregated.price_props.median);
-    assert!(aggregated.price_props.median <= aggregated.price_props.max);
+    assert!(aggregated.min <= aggregated.median);
+    assert!(aggregated.median <= aggregated.max);
 }
 
 #[test]
@@ -156,7 +159,7 @@ fn mock_rpc_integration_transaction_failure_detection() {
 #[test]
 fn mock_rpc_integration_verified_signature_keypair() {
     // Actually exercise signing and verification against a keypair
-    use ed25519_dalek::{Signature, Verifier};
+    use ed25519_dalek::Verifier;
 
     let private_key_hex = "1111111111111111111111111111111111111111111111111111111111111111";
     let network_passphrase = "Test SDF Network ; September 2015";
