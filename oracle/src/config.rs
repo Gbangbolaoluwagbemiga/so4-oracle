@@ -825,6 +825,52 @@ mod tests {
         ));
     }
 
+    /// #1202 — a valid `G…` account strkey is not a token contract address.
+    #[test]
+    fn reject_token_with_account_stellar_address() {
+        let account = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7";
+        assert!(stellar_strkey::ed25519::PublicKey::from_string(account).is_ok());
+        let json = format!(
+            r#"[{{"symbol":"BTC","stellar_address":"{account}","sources":["binance"],"binance_symbol":"BTCUSDT"}}]"#
+        );
+        let err = parse_price_feed_config(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidToken { ref symbol, ref reason }
+                if symbol == "BTC" && reason.contains("contract strkey")
+        ));
+    }
+
+    /// #1202 — placeholder / malformed addresses are rejected at load time.
+    #[test]
+    fn reject_token_with_malformed_stellar_address() {
+        for bad in [
+            "CBTCADDR",
+            "not-a-strkey",
+            "CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKEA",
+        ] {
+            let json = format!(
+                r#"[{{"symbol":"BTC","stellar_address":"{bad}","sources":["binance"],"binance_symbol":"BTCUSDT"}}]"#
+            );
+            let err = parse_price_feed_config(&json).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidToken { ref symbol, ref reason }
+                        if symbol == "BTC" && reason.contains("contract strkey")
+                ),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    /// #1202 — the embedded default tokens.json must still load.
+    #[test]
+    fn embedded_tokens_json_has_valid_contract_addresses() {
+        parse_price_feed_config(include_str!("../../config/tokens.json"))
+            .expect("config/tokens.json must parse with valid contract strkeys");
+    }
+
     #[test]
     fn reject_token_with_empty_sources() {
         let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":[]}]"#;
