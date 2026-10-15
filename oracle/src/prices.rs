@@ -942,4 +942,39 @@ mod tests {
         assert_eq!(result.filtered_prices, vec![42]);
         assert!(result.rejected.is_empty());
     }
+
+    // ── #1181: cluster tolerance, mutual consistency, order independence ─────
+
+    #[test]
+    fn cluster_tolerance_follows_looser_token_config() {
+        assert_eq!(cluster_tolerance_bps(200), DEFAULT_CLUSTER_TOLERANCE_BPS);
+        assert_eq!(cluster_tolerance_bps(800), 800);
+
+        // 100 vs 107 is 700 bps: cut at the default 5%, kept at an 8% token config.
+        let sources = names(3);
+        assert!(aggregate_prices(&[100, 107, 104], &sources, 3, 400).is_err());
+        let ok = aggregate_prices(&[100, 107, 104], &sources, 3, 800).unwrap();
+        assert_eq!(ok.sources_used.len(), 3);
+    }
+
+    #[test]
+    fn cluster_members_are_pairwise_within_tolerance() {
+        // 95 and 105 are each within 5% of 100 but ~10.5% apart from each other.
+        let cluster = find_largest_consistent_cluster(&[95, 100, 105], &names(3), 500).unwrap();
+        assert_eq!(cluster.filtered_prices.len(), 2);
+    }
+
+    #[test]
+    fn cluster_choice_is_independent_of_source_order() {
+        // Two equal-size, equal-spread clusters: the result must not depend on listing order.
+        let prices = [100i128, 102, 200, 204];
+        let forward = find_largest_consistent_cluster(&prices, &names(4), 500).unwrap();
+        let mut rev_p = prices.to_vec();
+        let mut rev_s = names(4);
+        rev_p.reverse();
+        rev_s.reverse();
+        let backward = find_largest_consistent_cluster(&rev_p, &rev_s, 500).unwrap();
+        assert_eq!(forward.filtered_prices, backward.filtered_prices);
+        assert_eq!(forward.sources, backward.sources);
+    }
 }
