@@ -815,6 +815,23 @@ mod tests {
         (0..n).map(|i| format!("src{i}")).collect()
     }
 
+    /// Every rotation and the reversal of `prices` (sources permuted alongside).
+    fn permutations(prices: &[i128]) -> Vec<(Vec<i128>, Vec<String>)> {
+        let sources = names(prices.len());
+        let mut out = Vec::new();
+        for r in 0..prices.len() {
+            let mut p = prices.to_vec();
+            let mut s = sources.clone();
+            p.rotate_left(r);
+            s.rotate_left(r);
+            out.push((p.clone(), s.clone()));
+            p.reverse();
+            s.reverse();
+            out.push((p, s));
+        }
+        out
+    }
+
     #[test]
     fn property_min_max_within_input_range() {
         // With zero spread the band is pure percentiles, so it must sit inside the inputs.
@@ -854,6 +871,24 @@ mod tests {
     }
 
     #[test]
+    fn property_aggregate_prices_min_lte_median_lte_max() {
+        for prices in [
+            vec![100i128, 101, 102],
+            vec![1000, 1001, 1002, 1003, 1004],
+            vec![100, 101, 99, 5000],
+        ] {
+            let result = aggregate_prices(&prices, &names(prices.len()), 1, 10_000).unwrap();
+            assert!(
+                result.min <= result.median && result.median <= result.max,
+                "min {} <= median {} <= max {} violated for {prices:?}",
+                result.min,
+                result.median,
+                result.max
+            );
+        }
+    }
+
+    #[test]
     fn property_filter_outliers_idempotent() {
         for prices in [
             vec![100i128, 101, 102, 103, 10000],
@@ -880,6 +915,25 @@ mod tests {
                 prices.len(),
                 "every source must be either used or rejected for {prices:?}"
             );
+        }
+    }
+
+    #[test]
+    fn property_aggregate_prices_order_insensitive() {
+        for prices in [
+            vec![1000i128, 1010, 1020, 1030, 1040],
+            vec![100i128, 101, 99, 5000],
+            vec![1000i128, 1001, 1002, 1003, 1004, 1200],
+        ] {
+            let baseline = aggregate_prices(&prices, &names(prices.len()), 2, 500).unwrap();
+            for (p, s) in permutations(&prices) {
+                let r = aggregate_prices(&p, &s, 2, 500).unwrap();
+                assert_eq!(
+                    (r.min, r.median, r.max),
+                    (baseline.min, baseline.median, baseline.max),
+                    "result depends on input order: {p:?}"
+                );
+            }
         }
     }
 
