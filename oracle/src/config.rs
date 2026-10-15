@@ -1142,6 +1142,8 @@ mod tests {
 
         assert_eq!(cfg.network, Network::Testnet);
         assert_eq!(cfg.stellar_rpc_url, TESTNET_RPC_URL);
+        // #1169 — pin the literal so the default can't regress to a non-RPC host.
+        assert_eq!(cfg.stellar_rpc_url, "https://soroban-testnet.stellar.org");
         assert_eq!(cfg.network_passphrase, TESTNET_PASSPHRASE);
         assert_eq!(
             cfg.price_loop_interval,
