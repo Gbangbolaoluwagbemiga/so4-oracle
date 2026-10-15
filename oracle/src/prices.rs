@@ -2,9 +2,17 @@
 /// With fewer sources we fall back to an equal spread around the median.
 pub const MIN_SOURCES_FOR_PERCENTILE: usize = 3;
 
-/// Default tolerance in basis points for price clustering.
-/// Sources within this tolerance of each other are considered consistent.
+/// Default (minimum) tolerance in basis points for price clustering. Every
+/// pair of sources in a cluster must be within this tolerance of each other.
+/// A token whose `max_deviation_bps` is larger loosens the cluster to match
+/// (#1181); a smaller value is enforced by the later outlier filter.
 pub const DEFAULT_CLUSTER_TOLERANCE_BPS: u32 = 500; // 5%
+
+/// Cluster tolerance for a token: its own `max_deviation_bps`, floored at
+/// [`DEFAULT_CLUSTER_TOLERANCE_BPS`] (#1181).
+pub fn cluster_tolerance_bps(max_deviation_bps: u32) -> u32 {
+    max_deviation_bps.max(DEFAULT_CLUSTER_TOLERANCE_BPS)
+}
 
 /// Price spread returned for on-chain submission.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,8 +58,9 @@ pub fn aggregate_prices(
 
     // Find the largest mutually-consistent cluster of sources.
     // This prevents a colluding minority from dictating the median.
-    let cluster = find_largest_consistent_cluster(prices, sources, DEFAULT_CLUSTER_TOLERANCE_BPS)
-        .ok_or_else(|| "no consistent price cluster found".to_string())?;
+    let cluster =
+        find_largest_consistent_cluster(prices, sources, cluster_tolerance_bps(max_deviation_bps))
+            .ok_or_else(|| "no consistent price cluster found".to_string())?;
 
     if cluster.filtered_prices.len() < min_sources {
         return Err(format!(
@@ -119,8 +128,13 @@ struct ClusterResult {
     sources: Vec<String>,
 }
 
-/// Find the largest cluster of prices that are mutually consistent (within tolerance).
-/// Returns the cluster with the most sources, breaking ties by tighter spread.
+/// Find the largest cluster of prices that are mutually consistent: every
+/// pair of members is within `tolerance_bps` of each other (#1181).
+///
+/// Prices are sorted (by price, then source name), so a candidate cluster is a
+/// contiguous window and its worst pair is (lowest, highest). Ties between
+/// equal-size windows go to the tighter spread, then the lower prices — never
+/// to the order sources happen to be listed in config.
 fn find_largest_consistent_cluster(
     prices: &[i128],
     sources: &[String],
@@ -130,53 +144,30 @@ fn find_largest_consistent_cluster(
         return None;
     }
 
-    // For each price, find all other prices within tolerance
-    let mut best_cluster: Option<ClusterResult> = None;
-    let mut best_size = 0;
+    let mut sorted: Vec<(i128, &String)> = prices.iter().copied().zip(sources.iter()).collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
 
-    for i in 0..prices.len() {
-        let mut cluster_prices = vec![prices[i]];
-        let mut cluster_sources = vec![sources[i].clone()];
-
-        for j in 0..prices.len() {
-            if i == j {
-                continue;
-            }
-            let dev_bps = deviation_bps(prices[j], prices[i]);
-            if dev_bps <= tolerance_bps as f64 {
-                cluster_prices.push(prices[j]);
-                cluster_sources.push(sources[j].clone());
-            }
+    // (start, end) of the best window, end exclusive.
+    let mut best = (0usize, 1usize);
+    let mut start = 0usize;
+    for end in 1..=sorted.len() {
+        let hi = sorted[end - 1].0;
+        while deviation_bps(hi, sorted[start].0) > tolerance_bps as f64 {
+            start += 1;
         }
-
-        if cluster_prices.len() > best_size
-            || (cluster_prices.len() == best_size
-                && cluster_spread(&cluster_prices)
-                    < cluster_spread(
-                        best_cluster
-                            .as_ref()
-                            .map(|c| &c.filtered_prices)
-                            .map_or(&[], |v| v),
-                    ))
-        {
-            best_size = cluster_prices.len();
-            best_cluster = Some(ClusterResult {
-                filtered_prices: cluster_prices,
-                sources: cluster_sources,
-            });
+        let (len, best_len) = (end - start, best.1 - best.0);
+        let spread = hi - sorted[start].0;
+        let best_spread = sorted[best.1 - 1].0 - sorted[best.0].0;
+        if len > best_len || (len == best_len && spread < best_spread) {
+            best = (start, end);
         }
     }
 
-    best_cluster
-}
-
-fn cluster_spread(prices: &[i128]) -> i128 {
-    if prices.len() < 2 {
-        return 0;
-    }
-    let mut sorted = prices.to_vec();
-    sorted.sort_unstable();
-    sorted.last().unwrap() - sorted.first().unwrap()
+    let window = &sorted[best.0..best.1];
+    Some(ClusterResult {
+        filtered_prices: window.iter().map(|(p, _)| *p).collect(),
+        sources: window.iter().map(|(_, s)| (*s).clone()).collect(),
+    })
 }
 
 pub fn compute_confidence_interval(prices: &[i128]) -> Option<PriceProps> {
@@ -950,5 +941,40 @@ mod tests {
         let result = filter_outliers(&[42], &["only".to_string()], 500);
         assert_eq!(result.filtered_prices, vec![42]);
         assert!(result.rejected.is_empty());
+    }
+
+    // ── #1181: cluster tolerance, mutual consistency, order independence ─────
+
+    #[test]
+    fn cluster_tolerance_follows_looser_token_config() {
+        assert_eq!(cluster_tolerance_bps(200), DEFAULT_CLUSTER_TOLERANCE_BPS);
+        assert_eq!(cluster_tolerance_bps(800), 800);
+
+        // 100 vs 107 is 700 bps: cut at the default 5%, kept at an 8% token config.
+        let sources = names(3);
+        assert!(aggregate_prices(&[100, 107, 104], &sources, 3, 400).is_err());
+        let ok = aggregate_prices(&[100, 107, 104], &sources, 3, 800).unwrap();
+        assert_eq!(ok.sources_used.len(), 3);
+    }
+
+    #[test]
+    fn cluster_members_are_pairwise_within_tolerance() {
+        // 95 and 105 are each within 5% of 100 but ~10.5% apart from each other.
+        let cluster = find_largest_consistent_cluster(&[95, 100, 105], &names(3), 500).unwrap();
+        assert_eq!(cluster.filtered_prices.len(), 2);
+    }
+
+    #[test]
+    fn cluster_choice_is_independent_of_source_order() {
+        // Two equal-size, equal-spread clusters: the result must not depend on listing order.
+        let prices = [100i128, 102, 200, 204];
+        let forward = find_largest_consistent_cluster(&prices, &names(4), 500).unwrap();
+        let mut rev_p = prices.to_vec();
+        let mut rev_s = names(4);
+        rev_p.reverse();
+        rev_s.reverse();
+        let backward = find_largest_consistent_cluster(&rev_p, &rev_s, 500).unwrap();
+        assert_eq!(forward.filtered_prices, backward.filtered_prices);
+        assert_eq!(forward.sources, backward.sources);
     }
 }
