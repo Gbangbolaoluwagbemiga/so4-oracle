@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::extract::MatchedPath;
-use axum::body::Body;
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, Method, StatusCode};
@@ -79,7 +79,12 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
             .and_then(|value| value.strip_prefix("Bearer "));
 
         match actual {
-            Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_str().as_bytes()) => {
+            Some(actual)
+                if crate::auth::constant_time_eq(
+                    actual.as_bytes(),
+                    expected.as_str().as_bytes(),
+                ) =>
+            {
                 Ok(AdminAuth)
             }
             _ => {
@@ -240,9 +245,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/oracle/failed-submissions",
             get(prices::failed_submissions),
         )
-        .fallback(|| async {
-            ApiError::new(StatusCode::NOT_FOUND, "not_found")
-        })
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found") })
         .with_state(state.clone())
         // #1044 — CatchPanicLayer must be the OUTERMOST layer so it wraps
         // every handler. With `panic = "abort"` in the release profile a
@@ -276,26 +279,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(map_method_not_allowed))
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-
-    for index in 0..max_len {
-        let a = left.get(index).copied().unwrap_or(0);
-        let b = right.get(index).copied().unwrap_or(0);
-        diff |= (a ^ b) as usize;
-    }
-
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
     use crate::{AppState, Config};
     use axum::body::Body;
     use axum::http::header::CACHE_CONTROL;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -320,13 +309,6 @@ mod tests {
                 "missing/incorrect Cache-Control on {uri}"
             );
         }
-    }
-
-    #[test]
-    fn constant_time_comparison_matches_equal_values_only() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secret", b"Secret"));
-        assert!(!constant_time_eq(b"secret", b"secret2"));
     }
 
     // #1029 — a wrong HTTP method on a known route must return the API's JSON
