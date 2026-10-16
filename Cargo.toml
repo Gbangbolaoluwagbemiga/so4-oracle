@@ -11,11 +11,13 @@ mismatched_lifetime_syntaxes = "allow"
 
 # Aligned with railway.json healthcheck: setting healthcheckPath to /ready
 # ensures the probe reflects real liveness (/ready inspects state.cycle_status).
-# Setting panic = "abort" ensures any unexpected panic crashes the process,
-# allowing the ON_FAILURE restart policy to detect and restart it.
+# panic = "unwind" is required for CatchPanicLayer to function — with
+# panic = "abort", a single panicking handler kills the entire process
+# immediately (#1213). The process-level restart is still handled by the
+# railway/fly ON_FAILURE policy if the whole binary exits.
 [profile.release]
 overflow-checks = true
-panic = "abort"
+panic = "unwind"
 
 # Force all transitive stellar-strkey versions to converge on 0.0.18 (#1007).
 # stellar-xdr v27 pins stellar-strkey 0.0.13 transitively; the direct

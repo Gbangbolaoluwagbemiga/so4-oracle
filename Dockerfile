@@ -1,7 +1,8 @@
 # Build stage
 # Must stay >= the highest MSRV in Cargo.lock — stellar-rpc-client 27 requires
 # Rust 1.93, jsonrpsee 0.26 requires 1.85, axum 0.8 requires 1.80.
-FROM rust:1.95-slim AS builder
+# Pinned to digest for reproducibility and supply-chain security (#1218).
+FROM rust:1.95-slim@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0 AS builder
 
 WORKDIR /app
 
@@ -23,7 +24,8 @@ COPY config ./config
 RUN cargo build --release --locked --bin oracle
 
 # Runtime stage
-FROM debian:bookworm-slim
+# Pinned to digest for reproducibility and supply-chain security (#1218).
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 WORKDIR /app
 
