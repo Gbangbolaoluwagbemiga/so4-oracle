@@ -99,7 +99,7 @@ pub fn build_balance_response(cfg: &KeeperBalanceConfig, stroops: i64) -> Balanc
         account_id: cfg.account_id.clone(),
         balance_stroops: stroops,
         balance_xlm: spendable_xlm,
-        below_minimum: xlm < cfg.min_balance_xlm,
+        below_minimum: spendable_xlm < cfg.min_balance_xlm,
         min_balance_xlm: cfg.min_balance_xlm,
     }
 }

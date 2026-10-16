@@ -322,15 +322,6 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
         "found_pending_work"
     );
 
-    // Submit prices on-chain - only fresh prices are included
-    // #1208 — Only sleep after set_prices when prices were actually submitted.
-    // The 5s delay was originally to let the transaction propagate before
-    // executing handlers that depend on those prices. If set_prices wasn't
-    // called (no fresh prices), the sleep serves no purpose and wastes time.
-    if !fresh_prices.is_empty() {
-        let tx_hash = set_prices_on_chain(&state, &fresh_prices).await?;
-        info!(hash = %tx_hash, "set_prices_confirmed");
-        tokio::time::sleep(Duration::from_millis(5000)).await;
     if keeper_balance_low {
         warn!("keeper_balance_below_min; skipping all on-chain submissions this cycle");
         return Ok(CycleSummary::skipped(prices_stale, keeper_balance_low));
