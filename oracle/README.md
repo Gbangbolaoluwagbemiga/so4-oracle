@@ -27,7 +27,9 @@ Optional defaults:
 
 - `ADMIN_API_TOKEN` — when unset, admin-only endpoints (e.g.
   `/oracle/failed-submissions`) respond `503`; when set, they require
-  `Authorization: Bearer <token>`
+  `Authorization: Bearer <token>`. Must be at least 32 characters (the
+  `.env.example` placeholder is rejected at startup); repeated failed attempts
+  from one client are throttled with `429`
 - `PYTH_API_KEY` — optional API key for Pyth price feeds
 
 - `BIND_ADDR=0.0.0.0:8080`

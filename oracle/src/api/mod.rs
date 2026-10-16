@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::FromRequestParts;
-use axum::extract::MatchedPath;
+use axum::extract::{ConnectInfo, MatchedPath};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, Method, StatusCode};
@@ -72,6 +72,20 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
             )
         })?;
 
+        // Throttle brute-force attempts per client before comparing (#1214).
+        let client = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let now = std::time::Instant::now();
+        if state.admin_auth_limiter.is_blocked(&client, now) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed admin auth attempts; try again later",
+            ));
+        }
+
         let actual = parts
             .headers
             .get(AUTHORIZATION)
@@ -85,9 +99,11 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
                     expected.as_str().as_bytes(),
                 ) =>
             {
+                state.admin_auth_limiter.record_success(&client);
                 Ok(AdminAuth)
             }
             _ => {
+                state.admin_auth_limiter.record_failure(&client, now);
                 let route = parts
                     .extensions
                     .get::<MatchedPath>()
@@ -309,6 +325,38 @@ mod tests {
                 "missing/incorrect Cache-Control on {uri}"
             );
         }
+    }
+
+    // #1214 — repeated wrong admin tokens from one client are throttled with
+    // 429 (even if the next attempt is correct), until the window resets.
+    #[tokio::test]
+    async fn admin_auth_throttles_repeated_failures() {
+        let mut config = Config::default_for_tests();
+        let token = "t".repeat(crate::config::MIN_ADMIN_API_TOKEN_LEN);
+        config.admin_api_token = Some(crate::config::SecretString::new(token.clone()));
+        let state = Arc::new(AppState::new(Arc::new(config)));
+        let app = super::build_router(state);
+
+        let call = |bearer: String| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .uri("/oracle/failed-submissions")
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(request).await.unwrap().status()
+            }
+        };
+
+        for _ in 0..crate::state::MAX_ADMIN_AUTH_FAILURES {
+            assert_eq!(call("wrong".to_string()).await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            call("wrong".to_string()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(call(token).await, StatusCode::TOO_MANY_REQUESTS);
     }
 
     // #1029 — a wrong HTTP method on a known route must return the API's JSON
