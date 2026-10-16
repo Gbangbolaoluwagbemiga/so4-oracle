@@ -1477,10 +1477,50 @@ async fn get_account_sequence_once(state: &Arc<AppState>) -> Result<u64, Sequenc
     })
 }
 
+/// Failure of a single `simulateTransaction` call, split so the retry loop
+/// only retries what can actually change on a retry (#1227).
+#[derive(Debug)]
+enum SimulateError {
+    /// Building the request (args → ScVal, envelope, JSON). Deterministic.
+    Build(String),
+    /// The HTTP/RPC transport. Retryability is delegated to [`RpcError`]
+    /// (network errors, 5xx and 429 retry; parse errors and RPC faults don't).
+    Transport(crate::stellar_rpc::RpcError),
+    /// The RPC answered but the response is unusable (unparseable JSON,
+    /// missing `result`). Deterministic for the same request.
+    Response(String),
+    /// The RPC answered with an `error` (e.g. contract revert, type mismatch
+    /// in the arguments). Deterministic for the same request.
+    Simulation(String),
+}
+
+impl crate::retry::Retryable for SimulateError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            SimulateError::Transport(e) => crate::retry::Retryable::is_retryable(e),
+            SimulateError::Build(_) | SimulateError::Response(_) | SimulateError::Simulation(_) => {
+                false
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SimulateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SimulateError::Build(msg) | SimulateError::Response(msg) => f.write_str(msg),
+            SimulateError::Transport(e) => write!(f, "{e}"),
+            SimulateError::Simulation(msg) => write!(f, "Simulation error: {msg}"),
+        }
+    }
+}
+
 /// Retry wrapper around [`simulate_contract_call_once`]: a single transient
 /// RPC failure on either of `get_pending_keys`' two simulate calls otherwise
 /// makes the keeper treat "no pending work" as the result for the whole
 /// cycle. Matches `get_account_sequence`'s `retry_with_backoff` usage (#799).
+/// Only transport failures are retried; deterministic failures return on the
+/// first attempt (#1227). Callers still receive a `String` error.
 async fn simulate_contract_call(
     state: &Arc<AppState>,
     contract_id: &str,
@@ -1494,6 +1534,7 @@ async fn simulate_contract_call(
         crate::retry::MAX_BACKOFF_DELAY_MS,
     )
     .await
+    .map_err(|e| e.to_string())
 }
 
 async fn simulate_contract_call_once(
@@ -1501,7 +1542,7 @@ async fn simulate_contract_call_once(
     contract_id: &str,
     method: &str,
     args: &[&str],
-) -> Result<String, String> {
+) -> Result<String, SimulateError> {
     use stellar_xdr::{TransactionEnvelope, TransactionV1Envelope, WriteXdr};
 
     let rpc_url = &state.config.stellar_rpc_url;
@@ -1523,7 +1564,8 @@ async fn simulate_contract_call_once(
                 Ok(stellar_xdr::ScVal::Symbol(sym))
             }
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(SimulateError::Build)?;
 
     // Build a proper XDR transaction envelope using the same pipeline as
     // sendTransaction, instead of hand-rolling a JSON object that doesn't
@@ -1536,7 +1578,8 @@ async fn simulate_contract_call_once(
         100,
         0, // sequence number is irrelevant for simulation
         None,
-    )?;
+    )
+    .map_err(SimulateError::Build)?;
 
     let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
         tx,
@@ -1545,7 +1588,7 @@ async fn simulate_contract_call_once(
 
     let envelope_xdr = envelope
         .to_xdr(stellar_xdr::Limits::none())
-        .map_err(|e| format!("failed to serialize envelope to XDR: {e}"))?;
+        .map_err(|e| SimulateError::Build(format!("failed to serialize envelope to XDR: {e}")))?;
     let envelope_b64 =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &envelope_xdr);
 
@@ -1557,23 +1600,25 @@ async fn simulate_contract_call_once(
             "transaction": envelope_b64
         }
     }))
-    .map_err(|e| format!("failed to serialize request: {e}"))?;
+    .map_err(|e| SimulateError::Build(format!("failed to serialize request: {e}")))?;
 
     // Use the shared RPC POST helper instead of hand-rolling the request here (#751).
     let body = crate::stellar_rpc::rpc_post(rpc_url, payload)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(SimulateError::Transport)?;
 
-    let response_json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse RPC response: {e}"))?;
+    let response_json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| SimulateError::Response(format!("Failed to parse RPC response: {e}")))?;
 
     if let Some(error) = response_json.get("error") {
-        return Err(format!("Simulation error: {}", truncate_rpc_error(error)));
+        return Err(SimulateError::Simulation(
+            truncate_rpc_error(error).to_string(),
+        ));
     }
 
-    let result = response_json
-        .get("result")
-        .ok_or_else(|| "Missing result in simulation response".to_string())?;
+    let result = response_json.get("result").ok_or_else(|| {
+        SimulateError::Response("Missing result in simulation response".to_string())
+    })?;
 
     Ok(result.to_string())
 }
