@@ -208,8 +208,7 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
 
     let mut new_prices = std::collections::BTreeMap::new();
 
-    // Phase 1: Identify stale tokens (fast, cache-only reads).
-    let mut stale_keys = std::collections::HashSet::new();
+    // Phase 1: Log and count stale cached prices (fast, cache-only reads).
     {
         let cache = state.price_cache.read().await;
         for token in &state.config.price_feed.tokens {
@@ -226,35 +225,14 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
                     );
                     tokens_stale += 1;
                     // #1209 — Do NOT skip fetching for stale tokens. Stale tokens
-                    // are the ones that MOST need a fresh fetch. Remove the `continue`
-                    // so stale tokens fall through to build_cached_price below.
-                }
-            }
-            // Token is either not in cache, stale, or not stale — try to fetch fresh price
-            match build_cached_price(&state, token, ledger_seq, &pyth_prices, batch_failed).await {
-                Ok(price) => {
-                    new_prices.insert(key, price);
-                    tokens_ok += 1;
-                }
-                Err(error) => {
-                    let ctx = ErrorContext {
-                        token: token.stellar_address.clone(),
-                        symbol: token.symbol.clone(),
-                        ledger_seq,
-                    };
-                    record_error_with_context(
-                        &state,
-                        format!("price:{}", token.symbol),
-                        error,
-                        ctx,
-                    )
-                    stale_keys.insert(key);
+                    // are the ones that MOST need a fresh fetch, so they are only
+                    // counted here and still fetched in Phase 2 below.
                 }
             }
         }
     }
 
-    // Phase 2: Fetch all non-stale tokens concurrently (#968).
+    // Phase 2: Fetch every token concurrently, stale ones included (#968, #1209).
     // Each token's future owns an Arc clone of state and borrows the
     // shared price maps via Arc, so they can run in parallel.
     let pyth_prices = Arc::new(pyth_prices);
@@ -265,7 +243,6 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
         .price_feed
         .tokens
         .iter()
-        .filter(|token| !stale_keys.contains(&token.lookup_key()))
         .map(|token| {
             let state = Arc::clone(&state);
             let pyth = Arc::clone(&pyth_prices);

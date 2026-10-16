@@ -52,8 +52,12 @@ async fn main() {
     );
 
     let shutdown_token = state.shutdown_token.clone();
-    let server_future =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(shutdown_token.clone()));
+    let server_future = axum::serve(
+        listener,
+        // Peer addresses feed the per-client admin-auth limiter (#1214).
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_token.clone()));
 
     // Split the DEFAULT_SHUTDOWN_TIMEOUT_SECS budget between HTTP drain and
     // background-loop drain so the *total* worst-case shutdown stays within

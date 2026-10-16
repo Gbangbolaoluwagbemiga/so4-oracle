@@ -159,14 +159,6 @@ pub(crate) async fn rpc_post(rpc_url: &str, payload: String) -> Result<String, R
         .await
         .map_err(|e| RpcError::NetworkError(e.to_string()))?;
 
-    if status == 404 {
-        // Account does not exist on the network (unfunded) — return zero
-        // balance so the keeper can report a clear "balance unreadable"
-        // error instead of a generic HTTP error (#1216).
-        return Err(RpcError::UnfundedAccount(
-            account_id.to_string(),
-        ));
-    }
     if status != 200 {
         return Err(RpcError::HttpError {
             status,
@@ -279,9 +271,7 @@ pub async fn get_account_balance_stroops(
         // Account does not exist on the network (unfunded) — return zero
         // balance so the keeper can report a clear "balance unreadable"
         // error instead of a generic HTTP error (#1216).
-        return Err(RpcError::UnfundedAccount(
-            account_id.to_string(),
-        ));
+        return Err(RpcError::UnfundedAccount(account_id.to_string()));
     }
     if status != 200 {
         return Err(RpcError::HttpError {

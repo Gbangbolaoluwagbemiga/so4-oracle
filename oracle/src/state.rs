@@ -154,6 +154,48 @@ pub const MAX_CONSECUTIVE_EXECUTION_FAILURES: u32 = 5;
 /// stuck orders within a handful of keeper cycles.
 pub const IN_FLIGHT_EXPIRY: Duration = Duration::from_secs(300);
 
+/// Failed admin-auth attempts allowed per client within [`ADMIN_AUTH_WINDOW`]
+/// before further attempts are rejected with 429 until the window ends (#1214).
+pub const MAX_ADMIN_AUTH_FAILURES: u32 = 5;
+pub const ADMIN_AUTH_WINDOW: Duration = Duration::from_secs(60);
+/// Cap on tracked clients so the map can't grow without bound.
+const MAX_TRACKED_ADMIN_CLIENTS: usize = 10_000;
+
+/// Per-client failure counter for `AdminAuth` (#1214). Keyed by client IP
+/// (or "unknown" when the peer address isn't available, e.g. in tests).
+#[derive(Default)]
+pub struct AdminAuthLimiter {
+    failures: std::sync::Mutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl AdminAuthLimiter {
+    /// True when `client` has used up its failure budget for the current window.
+    pub fn is_blocked(&self, client: &str, now: Instant) -> bool {
+        let map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(map.get(client), Some((count, start))
+            if *count >= MAX_ADMIN_AUTH_FAILURES && now.duration_since(*start) < ADMIN_AUTH_WINDOW)
+    }
+
+    pub fn record_failure(&self, client: &str, now: Instant) {
+        let mut map = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_TRACKED_ADMIN_CLIENTS {
+            map.retain(|_, (_, start)| now.duration_since(*start) < ADMIN_AUTH_WINDOW);
+        }
+        let entry = map.entry(client.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) >= ADMIN_AUTH_WINDOW {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+    }
+
+    pub fn record_success(&self, client: &str) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(client);
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -187,6 +229,8 @@ pub struct AppState {
     /// crossed its two sequential lock reads and retry, rather than returning a
     /// torn `keeper_status` / `cycle_status` pair (#797).
     pub keeper_cycle_generation: Arc<AtomicU64>,
+    /// Throttles repeated failed admin-token attempts per client (#1214).
+    pub admin_auth_limiter: Arc<AdminAuthLimiter>,
 }
 
 impl AppState {
@@ -207,6 +251,7 @@ impl AppState {
             execution_failure_counts: Arc::new(Mutex::new(HashMap::new())),
             keeper_balance_below_min: Arc::new(AtomicBool::new(false)),
             keeper_cycle_generation: Arc::new(AtomicU64::new(0)),
+            admin_auth_limiter: Arc::new(AdminAuthLimiter::default()),
         }
     }
 
@@ -269,5 +314,38 @@ mod tests {
         buffer.push(3);
 
         assert_eq!(buffer.iter().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod admin_auth_limiter_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_after_max_failures_and_resets_after_window() {
+        let limiter = AdminAuthLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_ADMIN_AUTH_FAILURES {
+            assert!(!limiter.is_blocked("1.2.3.4", t0));
+            limiter.record_failure("1.2.3.4", t0);
+        }
+        assert!(limiter.is_blocked("1.2.3.4", t0));
+        assert!(
+            !limiter.is_blocked("5.6.7.8", t0),
+            "other clients are unaffected"
+        );
+        assert!(!limiter.is_blocked("1.2.3.4", t0 + ADMIN_AUTH_WINDOW));
+    }
+
+    #[test]
+    fn success_clears_failures() {
+        let limiter = AdminAuthLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_ADMIN_AUTH_FAILURES - 1 {
+            limiter.record_failure("1.2.3.4", t0);
+        }
+        limiter.record_success("1.2.3.4");
+        limiter.record_failure("1.2.3.4", t0);
+        assert!(!limiter.is_blocked("1.2.3.4", t0));
     }
 }

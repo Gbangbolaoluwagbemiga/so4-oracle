@@ -119,6 +119,25 @@ pub struct Config {
     pub price_feed: PriceFeedConfig,
 }
 
+/// Minimum length of `ADMIN_API_TOKEN`; shorter tokens are brute-forceable (#1214).
+pub const MIN_ADMIN_API_TOKEN_LEN: usize = 32;
+/// The sample value shipped in `.env.example`, rejected so it can't reach production.
+pub const ADMIN_API_TOKEN_PLACEHOLDER: &str = "your-admin-api-token-here";
+
+/// Reject admin tokens that are too short or still the documented placeholder (#1214).
+/// Never includes the token itself in the error.
+fn validate_admin_api_token(token: &str) -> Result<(), String> {
+    if token.trim() == ADMIN_API_TOKEN_PLACEHOLDER {
+        return Err("is still the .env.example placeholder; generate a random token".to_string());
+    }
+    if token.trim().chars().count() < MIN_ADMIN_API_TOKEN_LEN {
+        return Err(format!(
+            "must be at least {MIN_ADMIN_API_TOKEN_LEN} characters (e.g. `openssl rand -hex 32`)"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvError {
     MissingVar(&'static str),
@@ -284,7 +303,16 @@ impl Config {
 
         let admin_api_token = lookup("ADMIN_API_TOKEN")
             .filter(|value| !value.trim().is_empty())
-            .map(SecretString::new);
+            .and_then(|value| match validate_admin_api_token(&value) {
+                Ok(()) => Some(SecretString::new(value)),
+                Err(reason) => {
+                    errors.push(EnvError::InvalidVar {
+                        var: "ADMIN_API_TOKEN",
+                        reason,
+                    });
+                    None
+                }
+            });
         let pyth_api_key = lookup("PYTH_API_KEY")
             .filter(|value| !value.trim().is_empty())
             .map(SecretString::new);
@@ -1074,7 +1102,10 @@ mod tests {
                 "KEEPER_ACCOUNT_ID",
                 "GAUHMCMUP5FZO5675W3ISZ6E6CNYJGXBUW5WANE2JR4TGAARYCTSCBKI".to_string(),
             ),
-            ("ADMIN_API_TOKEN", "test-admin-token".to_string()),
+            (
+                "ADMIN_API_TOKEN",
+                "test-admin-token-0123456789abcdef".to_string(),
+            ),
         ])
     }
 
@@ -1340,6 +1371,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_short_or_placeholder_admin_token() {
+        for bad in ["short-token", ADMIN_API_TOKEN_PLACEHOLDER] {
+            let mut env = valid_env();
+            env.insert("ADMIN_API_TOKEN", bad.to_string());
+            let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+            assert!(
+                err.0.iter().any(|e| matches!(
+                    e,
+                    EnvError::InvalidVar {
+                        var: "ADMIN_API_TOKEN",
+                        ..
+                    }
+                )),
+                "{bad:?} must be rejected: {:?}",
+                err.0
+            );
+            // The token value itself must never appear in the error.
+            assert!(!format!("{:?}", err.0).contains("short-token"));
+        }
+    }
+
+    #[test]
+    fn config_from_lookup_accepts_long_admin_token() {
+        let mut env = valid_env();
+        env.insert("ADMIN_API_TOKEN", "a".repeat(MIN_ADMIN_API_TOKEN_LEN));
+        let cfg = Config::from_lookup(|key| env.get(key).cloned()).unwrap();
+        assert!(cfg.admin_api_token.is_some());
     }
 
     #[test]
