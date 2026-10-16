@@ -125,6 +125,28 @@ mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
 
+    // #1226 — signing with a key decoded once must match per-call decoding.
+    #[test]
+    fn sign_price_with_key_matches_sign_price() {
+        let hex_key = "1111111111111111111111111111111111111111111111111111111111111111";
+        let key = signing_key_from_hex(hex_key).unwrap();
+        let a = sign_price(hex_key, "net", 7, "tok", 10, 20, 100).unwrap();
+        let b = sign_price_with_key(&key, "net", 7, "tok", 10, 20, 100);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn signing_key_from_hex_rejects_bad_input() {
+        assert!(matches!(
+            signing_key_from_hex("not hex"),
+            Err(SigningError::InvalidHexKey)
+        ));
+        assert!(matches!(
+            signing_key_from_hex("1111"),
+            Err(SigningError::InvalidKeyLength)
+        ));
+    }
+
     #[test]
     fn test_sign_price_validates() {
         let private_key_hex = "1111111111111111111111111111111111111111111111111111111111111111";

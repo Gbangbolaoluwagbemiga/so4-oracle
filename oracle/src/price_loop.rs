@@ -579,16 +579,29 @@ fn signed_cached_price(
     aggregate: AggregatedPrice,
 ) -> Result<CachedPrice, String> {
     let timestamp = crate::current_timestamp_secs();
-    let signature = crate::signing::sign_price(
-        state.config.keeper_private_key.as_str(),
-        &state.config.network_passphrase,
-        ledger_seq,
-        &token.stellar_address,
-        aggregate.min,
-        aggregate.max,
-        timestamp,
-    )
-    .map_err(|err| err.to_string())?;
+    // Sign with the key decoded once at startup (#1226); fall back to the
+    // string key only so a missing/invalid key still reports its error.
+    let signature = match state.price_signing_key.as_deref() {
+        Some(key) => crate::signing::sign_price_with_key(
+            key,
+            &state.config.network_passphrase,
+            ledger_seq,
+            &token.stellar_address,
+            aggregate.min,
+            aggregate.max,
+            timestamp,
+        ),
+        None => crate::signing::sign_price(
+            state.config.keeper_private_key.as_str(),
+            &state.config.network_passphrase,
+            ledger_seq,
+            &token.stellar_address,
+            aggregate.min,
+            aggregate.max,
+            timestamp,
+        )
+        .map_err(|err| err.to_string())?,
+    };
 
     Ok(CachedPrice {
         token_address: token.stellar_address.clone(),
