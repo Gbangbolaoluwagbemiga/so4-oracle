@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, PartialEq, Clone)]
 pub enum RpcError {
     NetworkError(String),
+    UnfundedAccount(String),
     HttpError {
         status: u16,
         body: String,
@@ -32,6 +33,7 @@ impl crate::retry::Retryable for RpcError {
             RpcError::JsonError(_) => false,
             RpcError::RpcFault { .. } => false,
             RpcError::BalanceBelowMinimum { .. } => false,
+            RpcError::UnfundedAccount(_) => false,
         }
     }
 }
@@ -48,6 +50,7 @@ impl std::fmt::Display for RpcError {
                 }
             }
             RpcError::JsonError(msg) => write!(f, "JSON parse error: {msg}"),
+            RpcError::UnfundedAccount(msg) => write!(f, "unfunded account: {msg}"),
             RpcError::RpcFault { code, message } => {
                 write!(f, "RPC fault {code}: {message}")
             }
@@ -156,6 +159,14 @@ pub(crate) async fn rpc_post(rpc_url: &str, payload: String) -> Result<String, R
         .await
         .map_err(|e| RpcError::NetworkError(e.to_string()))?;
 
+    if status == 404 {
+        // Account does not exist on the network (unfunded) — return zero
+        // balance so the keeper can report a clear "balance unreadable"
+        // error instead of a generic HTTP error (#1216).
+        return Err(RpcError::UnfundedAccount(
+            account_id.to_string(),
+        ));
+    }
     if status != 200 {
         return Err(RpcError::HttpError {
             status,
@@ -264,6 +275,14 @@ pub async fn get_account_balance_stroops(
         .await
         .map_err(|e| RpcError::NetworkError(e.to_string()))?;
 
+    if status == 404 {
+        // Account does not exist on the network (unfunded) — return zero
+        // balance so the keeper can report a clear "balance unreadable"
+        // error instead of a generic HTTP error (#1216).
+        return Err(RpcError::UnfundedAccount(
+            account_id.to_string(),
+        ));
+    }
     if status != 200 {
         return Err(RpcError::HttpError {
             status,
