@@ -322,6 +322,15 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
         "found_pending_work"
     );
 
+    // Submit prices on-chain - only fresh prices are included
+    // #1208 — Only sleep after set_prices when prices were actually submitted.
+    // The 5s delay was originally to let the transaction propagate before
+    // executing handlers that depend on those prices. If set_prices wasn't
+    // called (no fresh prices), the sleep serves no purpose and wastes time.
+    if !fresh_prices.is_empty() {
+        let tx_hash = set_prices_on_chain(&state, &fresh_prices).await?;
+        info!(hash = %tx_hash, "set_prices_confirmed");
+        tokio::time::sleep(Duration::from_millis(5000)).await;
     if keeper_balance_low {
         warn!("keeper_balance_below_min; skipping all on-chain submissions this cycle");
         return Ok(CycleSummary::skipped(prices_stale, keeper_balance_low));
@@ -615,6 +624,14 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
     }
 
     for deposit_key in &deposit_keys {
+        // #1206 — Skip deposits when prices are stale. Deposits DO need prices
+        // (for collateral calculations); processing them with stale prices
+        // risks incorrect calculations.
+        if fresh_prices.is_empty() {
+            warn!(key = %deposit_key, "skipping_deposit_no_fresh_prices");
+            continue;
+        }
+
         // Skip permanently blacklisted deposits — retrying burns fee attempts (#892).
         {
             let blacklist = state.frozen_order_blacklist.lock().await;
@@ -784,6 +801,14 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
     }
 
     for withdrawal_key in &withdrawal_keys {
+        // #1206 — Skip withdrawals when prices are stale. Withdrawals DO need
+        // prices (for collateral calculations); processing them with stale
+        // prices risks incorrect calculations.
+        if fresh_prices.is_empty() {
+            warn!(key = %withdrawal_key, "skipping_withdrawal_no_fresh_prices");
+            continue;
+        }
+
         // Skip permanently blacklisted withdrawals — retrying burns fee attempts (#892).
         {
             let blacklist = state.frozen_order_blacklist.lock().await;

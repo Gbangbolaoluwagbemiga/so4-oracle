@@ -225,6 +225,29 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
                         "evicting stale cached price"
                     );
                     tokens_stale += 1;
+                    // #1209 — Do NOT skip fetching for stale tokens. Stale tokens
+                    // are the ones that MOST need a fresh fetch. Remove the `continue`
+                    // so stale tokens fall through to build_cached_price below.
+                }
+            }
+            // Token is either not in cache, stale, or not stale — try to fetch fresh price
+            match build_cached_price(&state, token, ledger_seq, &pyth_prices, batch_failed).await {
+                Ok(price) => {
+                    new_prices.insert(key, price);
+                    tokens_ok += 1;
+                }
+                Err(error) => {
+                    let ctx = ErrorContext {
+                        token: token.stellar_address.clone(),
+                        symbol: token.symbol.clone(),
+                        ledger_seq,
+                    };
+                    record_error_with_context(
+                        &state,
+                        format!("price:{}", token.symbol),
+                        error,
+                        ctx,
+                    )
                     stale_keys.insert(key);
                 }
             }
@@ -306,10 +329,13 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
         }
     }
 
-    // Update the cache with fresh and preserved entries
+    // #1210 — Update the cache incrementally after each token, not just at the end.
+    // This prevents one slow source from stalling the entire cache write.
     if !new_prices.is_empty() {
         let mut cache = state.price_cache.write().await;
-        cache.prices = new_prices;
+        for (key, price) in new_prices {
+            cache.prices.insert(key, price);
+        }
         cache.last_updated = Some(SystemTime::now());
 
         if tokens_stale > 0 {
