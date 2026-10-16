@@ -45,12 +45,13 @@ impl Network {
     }
 }
 
+/// A secret held in memory that is wiped (zeroised) when dropped (#1226).
 #[derive(Clone)]
-pub struct SecretString(String);
+pub struct SecretString(zeroize::Zeroizing<String>);
 
 impl SecretString {
     pub fn new(value: String) -> Self {
-        Self(value)
+        Self(zeroize::Zeroizing::new(value))
     }
 
     pub fn as_str(&self) -> &str {

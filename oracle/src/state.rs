@@ -229,12 +229,26 @@ pub struct AppState {
     /// crossed its two sequential lock reads and retry, rather than returning a
     /// torn `keeper_status` / `cycle_status` pair (#797).
     pub keeper_cycle_generation: Arc<AtomicU64>,
+    /// `KEEPER_PRIVATE_KEY` decoded once at startup for price signing (#1226).
+    /// `SigningKey` zeroises its seed on drop. `None` if unset or invalid, in
+    /// which case signing falls back to the string key and reports the error.
+    pub price_signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// `KEEPER_SECRET_KEY` decoded once at startup for transaction signing (#1226).
+    pub tx_signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// Throttles repeated failed admin-token attempts per client (#1214).
     pub admin_auth_limiter: Arc<AdminAuthLimiter>,
 }
 
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
+        let price_signing_key =
+            crate::signing::signing_key_from_hex(config.keeper_private_key.as_str())
+                .ok()
+                .map(Arc::new);
+        let tx_signing_key =
+            crate::chain::tx_builder::signing_key_from_secret(config.keeper_secret_key.as_str())
+                .ok()
+                .map(Arc::new);
         Self {
             config,
             http: crate::http::client().clone(),
@@ -251,6 +265,8 @@ impl AppState {
             execution_failure_counts: Arc::new(Mutex::new(HashMap::new())),
             keeper_balance_below_min: Arc::new(AtomicBool::new(false)),
             keeper_cycle_generation: Arc::new(AtomicU64::new(0)),
+            price_signing_key,
+            tx_signing_key,
             admin_auth_limiter: Arc::new(AdminAuthLimiter::default()),
         }
     }
@@ -347,5 +363,28 @@ mod admin_auth_limiter_tests {
         limiter.record_success("1.2.3.4");
         limiter.record_failure("1.2.3.4", t0);
         assert!(!limiter.is_blocked("1.2.3.4", t0));
+    }
+}
+
+#[cfg(test)]
+mod signing_key_state_tests {
+    use super::*;
+
+    // #1226 — keys are decoded once when AppState is built, not per signature.
+    #[test]
+    fn app_state_decodes_valid_keys_once_and_skips_invalid_ones() {
+        let mut config = Config::default_for_tests();
+        config.keeper_private_key = crate::config::SecretString::new("11".repeat(32));
+        config.keeper_secret_key = crate::config::SecretString::new("22".repeat(32));
+        let state = AppState::new(Arc::new(config));
+        assert!(state.price_signing_key.is_some());
+        assert!(state.tx_signing_key.is_some());
+
+        let state = AppState::new(Arc::new(Config::default_for_tests()));
+        assert!(
+            state.price_signing_key.is_none(),
+            "empty key must not decode"
+        );
+        assert!(state.tx_signing_key.is_none(), "empty key must not decode");
     }
 }

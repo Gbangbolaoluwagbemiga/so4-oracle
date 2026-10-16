@@ -62,6 +62,21 @@ impl std::fmt::Display for SequenceFetchError {
     }
 }
 
+/// Sign a keeper transaction with the key decoded once at startup (#1226),
+/// falling back to the string key so a missing/invalid key reports its error.
+fn sign_keeper_tx(state: &AppState, tx: &stellar_xdr::Transaction) -> Result<String, String> {
+    match state.tx_signing_key.as_deref() {
+        Some(key) => {
+            tx_builder::sign_transaction_with_key(tx, key, &state.config.network_passphrase)
+        }
+        None => tx_builder::sign_transaction(
+            tx,
+            state.config.keeper_secret_key.as_str(),
+            &state.config.network_passphrase,
+        ),
+    }
+}
+
 const PRICE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 impl std::error::Error for SequenceFetchError {}
@@ -1217,11 +1232,7 @@ async fn set_prices_on_chain(
         None,
     )?;
 
-    let signed_xdr = tx_builder::sign_transaction(
-        &tx,
-        state.config.keeper_secret_key.as_str(),
-        &state.config.network_passphrase,
-    )?;
+    let signed_xdr = sign_keeper_tx(&state, &tx)?;
 
     let ledger = crate::submit::submit_and_poll(&state.config.stellar_rpc_url, &signed_xdr)
         .await
@@ -1388,11 +1399,7 @@ async fn execute_handler(
         None,
     )?;
 
-    let signed_xdr = tx_builder::sign_transaction(
-        &tx,
-        state.config.keeper_secret_key.as_str(),
-        &state.config.network_passphrase,
-    )?;
+    let signed_xdr = sign_keeper_tx(&state, &tx)?;
 
     match crate::submit::submit_and_poll(&state.config.stellar_rpc_url, &signed_xdr).await {
         Ok(ledger) => {
