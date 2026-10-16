@@ -379,6 +379,49 @@ impl Config {
             Duration::from_millis(DEFAULT_KEEPER_LOOP_MS)
         );
 
+        // Every contract role must point at a different contract. `required`
+        // only proves each var is present and non-empty, so pasting one
+        // address into two slots (an easy copy/paste slip from a deployment
+        // manifest) used to boot cleanly and then fail much later, at RPC
+        // simulation time, with a generic contract-level error naming neither
+        // variable. Catch it here and name both sides.
+        //
+        // Values are compared trimmed, so a stray trailing space cannot hide a
+        // collision. They are not case-folded: Soroban strkeys are
+        // case-sensitive, and a mixed-case value is invalid input that
+        // simulation will reject anyway.
+        let contract_roles: [(&'static str, &str); 7] = [
+            ("ORACLE_CONTRACT_ID", &oracle_contract_id),
+            ("ROLE_STORE", &role_store_contract_id),
+            ("DATA_STORE", &data_store_contract_id),
+            ("ORDER_HANDLER", &order_handler_contract_id),
+            ("DEPOSIT_HANDLER", &deposit_handler_contract_id),
+            ("WITHDRAWAL_HANDLER", &withdrawal_handler_contract_id),
+            ("READER", &reader_contract_id),
+        ];
+        let mut seen: std::collections::HashMap<&str, &'static str> =
+            std::collections::HashMap::new();
+        for (var, value) in contract_roles {
+            let value = value.trim();
+            // A missing/empty value is already reported by `required`; don't
+            // pile a duplicate-value error on top of it.
+            if value.is_empty() {
+                continue;
+            }
+            match seen.get(value) {
+                Some(previous) => errors.push(EnvError::InvalidVar {
+                    var,
+                    reason: format!(
+                        "is set to the same contract ID as {previous} ({value}); each contract \
+                         role must point at a distinct contract"
+                    ),
+                }),
+                None => {
+                    seen.insert(value, var);
+                }
+            }
+        }
+
         if !errors.is_empty() {
             return Err(EnvErrors(errors));
         }
@@ -478,7 +521,7 @@ fn validate_hex_key(
 /// Validate a Stellar strkey (account `G…` / secret seed `S…`) for shape only:
 /// 56-char base32 with the expected version prefix. This catches typos and
 /// swapped vars at boot; it does not verify the CRC16 or that a secret derives
-/// the configured account (those are wired with the keeper in #3).
+/// the configured account (those are tracked in the keeper module).
 fn validate_strkey(var: &'static str, value: String, prefix: char) -> Result<String, EnvError> {
     let invalid = |reason: String| EnvError::InvalidVar { var, reason };
     if value.len() != 56 {
@@ -507,7 +550,7 @@ fn load_price_feed_config(raw: Option<&str>) -> Result<PriceFeedConfig, ConfigEr
 ///
 /// Expected format:
 /// ```json
-/// [{"symbol":"BTC","stellar_address":"C...","sources":["binance","coinbase"]}]
+/// [{"symbol":"BTC","stellar_address":"C...","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"}]
 /// ```
 pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError> {
     let tokens = shared_config::parse_token_configs(raw)?;
@@ -518,6 +561,19 @@ pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError
             return Err(ConfigError::InvalidToken {
                 symbol: token.symbol.clone(),
                 reason: "stellar_address must not be empty".to_string(),
+            });
+        }
+        // Token prices are written for Soroban token contracts, so the address
+        // must be a valid `C…` contract strkey. Rejecting it here (#1202, #970)
+        // keeps one bad entry from failing `encode_prices_vec` for the whole
+        // `set_prices` batch at runtime.
+        if stellar_strkey::Contract::from_string(&token.stellar_address).is_err() {
+            return Err(ConfigError::InvalidToken {
+                symbol: token.symbol.clone(),
+                reason: format!(
+                    "stellar_address '{}' is not a valid contract strkey (C…)",
+                    token.stellar_address
+                ),
             });
         }
         if token.sources.is_empty() {
@@ -641,8 +697,8 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     const VALID_JSON: &str = r#"[
-        {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"},
-        {"symbol":"ETH","stellar_address":"CETHADDR","sources":["binance"],"binance_symbol":"ETHUSDT","min_sources":1}
+        {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"},
+        {"symbol":"ETH","stellar_address":"CAJ6BZKGFT47ALGMVFZZGAOXBV2RWIVYVCU4WJCQIURKRNXU346RWVAU","sources":["binance"],"binance_symbol":"ETHUSDT","min_sources":1}
     ]"#;
 
     #[test]
@@ -754,7 +810,7 @@ mod tests {
 
     #[test]
     fn reject_token_with_empty_symbol() {
-        let json = r#"[{"symbol":"","stellar_address":"CADDR","sources":["binance"],"binance_symbol":"BTCUSDT"}]"#;
+        let json = r#"[{"symbol":"","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"],"binance_symbol":"BTCUSDT"}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
@@ -769,9 +825,55 @@ mod tests {
         ));
     }
 
+    /// #1202 — a valid `G…` account strkey is not a token contract address.
+    #[test]
+    fn reject_token_with_account_stellar_address() {
+        let account = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7";
+        assert!(stellar_strkey::ed25519::PublicKey::from_string(account).is_ok());
+        let json = format!(
+            r#"[{{"symbol":"BTC","stellar_address":"{account}","sources":["binance"],"binance_symbol":"BTCUSDT"}}]"#
+        );
+        let err = parse_price_feed_config(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidToken { ref symbol, ref reason }
+                if symbol == "BTC" && reason.contains("contract strkey")
+        ));
+    }
+
+    /// #1202 — placeholder / malformed addresses are rejected at load time.
+    #[test]
+    fn reject_token_with_malformed_stellar_address() {
+        for bad in [
+            "CBTCADDR",
+            "not-a-strkey",
+            "CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKEA",
+        ] {
+            let json = format!(
+                r#"[{{"symbol":"BTC","stellar_address":"{bad}","sources":["binance"],"binance_symbol":"BTCUSDT"}}]"#
+            );
+            let err = parse_price_feed_config(&json).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidToken { ref symbol, ref reason }
+                        if symbol == "BTC" && reason.contains("contract strkey")
+                ),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    /// #1202 — the embedded default tokens.json must still load.
+    #[test]
+    fn embedded_tokens_json_has_valid_contract_addresses() {
+        parse_price_feed_config(include_str!("../../config/tokens.json"))
+            .expect("config/tokens.json must parse with valid contract strkeys");
+    }
+
     #[test]
     fn reject_token_with_empty_sources() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":[]}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":[]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(
             err,
@@ -782,8 +884,8 @@ mod tests {
     #[test]
     fn per_token_source_list_preserved() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1},
-            {"symbol":"ETH","stellar_address":"CEADDR","sources":["coinbase"],"coinbase_symbol":"ETH","min_sources":1}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1},
+            {"symbol":"ETH","stellar_address":"CAJ6BZKGFT47ALGMVFZZGAOXBV2RWIVYVCU4WJCQIURKRNXU346RWVAU","sources":["coinbase"],"coinbase_symbol":"ETH","min_sources":1}
         ]"#;
         let cfg = parse_price_feed_config(json).unwrap();
         assert_eq!(cfg.tokens[0].sources, vec!["binance"]);
@@ -802,14 +904,14 @@ mod tests {
     /// #324 — entry with empty symbol → InvalidToken.
     #[test]
     fn parse_token_configs_empty_symbol_returns_invalid_token() {
-        let json = r#"[{"symbol":"","stellar_address":"CADDR","sources":["binance"]}]"#;
+        let json = r#"[{"symbol":"","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_missing_coinbase_symbol() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["coinbase"]}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["coinbase"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
@@ -824,49 +926,49 @@ mod tests {
 
     #[test]
     fn reject_missing_binance_symbol() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["binance"]}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_missing_pyth_feed_id() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["pyth"]}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["pyth"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_empty_pyth_feed_id() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["pyth"],"pyth_feed_id":""}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["pyth"],"pyth_feed_id":""}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_missing_fixed_price() {
-        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"]}]"#;
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["fixed"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_empty_fixed_price() {
-        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"],"fixed_price":""}]"#;
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["fixed"],"fixed_price":""}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn per_source_rejects_unsupported_source() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":["kraken"]}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["kraken"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "BTC"));
     }
 
     #[test]
     fn per_source_rejects_empty_source_name() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":[""]}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":[""]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "BTC"));
     }
@@ -874,7 +976,7 @@ mod tests {
     #[test]
     fn reject_min_sources_exceeds_sources_length() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":2}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":2}
         ]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(
@@ -887,7 +989,7 @@ mod tests {
     #[test]
     fn accept_min_sources_equal_to_sources_length() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}
         ]"#;
         let cfg = parse_price_feed_config(json).unwrap();
         assert_eq!(cfg.tokens.len(), 1);
@@ -897,7 +999,7 @@ mod tests {
     #[test]
     fn accept_min_sources_less_than_sources_length() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC","min_sources":1}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC","min_sources":1}
         ]"#;
         let cfg = parse_price_feed_config(json).unwrap();
         assert_eq!(cfg.tokens.len(), 1);
@@ -917,7 +1019,7 @@ mod tests {
 
     #[test]
     fn load_price_feed_config_uses_env_when_set() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}]"#;
         let cfg = load_price_feed_config(Some(json)).unwrap();
         assert_eq!(cfg.tokens.len(), 1);
         assert_eq!(cfg.tokens[0].symbol, "BTC");
@@ -976,6 +1078,122 @@ mod tests {
         ])
     }
 
+    // ── distinct contract roles ───────────────────────────────────────────────
+
+    /// Flattens `EnvErrors` into one string per entry so a test can assert on
+    /// which variables were reported.
+    fn error_messages(err: &EnvErrors) -> Vec<String> {
+        match err {
+            EnvErrors(list) => list.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn distinct_contract_ids_boot_cleanly() {
+        let env = valid_env();
+        assert!(
+            Config::from_lookup(|key| env.get(key).cloned()).is_ok(),
+            "seven distinct contract IDs must not trip the duplicate check"
+        );
+    }
+
+    #[test]
+    fn duplicate_contract_ids_are_rejected_at_boot_naming_both_vars() {
+        let mut env = valid_env();
+        // The realistic operator slip: ORDER_HANDLER copy-pasted over
+        // DEPOSIT_HANDLER.
+        let shared = env.get("ORDER_HANDLER").unwrap().clone();
+        env.insert("DEPOSIT_HANDLER", shared.clone());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("duplicate contract IDs must fail at boot");
+
+        let messages = error_messages(&err);
+        assert_eq!(messages.len(), 1, "expected one error, got {messages:?}");
+        let message = &messages[0];
+        assert!(
+            message.contains("DEPOSIT_HANDLER"),
+            "error must name the offending var: {message}"
+        );
+        assert!(
+            message.contains("ORDER_HANDLER"),
+            "error must name the var it collides with: {message}"
+        );
+        assert!(
+            message.contains(&shared),
+            "error must quote the duplicated ID: {message}"
+        );
+    }
+
+    #[test]
+    fn every_contract_role_pair_is_checked() {
+        // Whichever var is overwritten with another var's value, the boot must
+        // fail — the check is not limited to one hand-picked pair.
+        let vars = [
+            "ORACLE_CONTRACT_ID",
+            "ROLE_STORE",
+            "DATA_STORE",
+            "ORDER_HANDLER",
+            "DEPOSIT_HANDLER",
+            "WITHDRAWAL_HANDLER",
+            "READER",
+        ];
+        for (i, target) in vars.iter().enumerate() {
+            let source = vars[(i + 1) % vars.len()];
+            let mut env = valid_env();
+            let value = env.get(source).unwrap().clone();
+            env.insert(*target, value);
+
+            let err = Config::from_lookup(|key| env.get(key).cloned())
+                .expect_err(&format!("{target} == {source} must fail at boot"));
+            let messages = error_messages(&err);
+            assert_eq!(
+                messages.len(),
+                1,
+                "{target} == {source}: expected one error, got {messages:?}"
+            );
+            assert!(
+                messages[0].contains(target) && messages[0].contains(source),
+                "{target} == {source}: error must name both vars, got {}",
+                messages[0]
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_surrounding_whitespace() {
+        let mut env = valid_env();
+        let order_handler = env.get("ORDER_HANDLER").unwrap().clone();
+        env.insert("READER", format!("  {order_handler}  "));
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("trailing whitespace must not hide a collision");
+        let messages = error_messages(&err);
+        assert!(
+            messages[0].contains("READER"),
+            "error must name the offending var: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn missing_contract_id_is_reported_once_not_as_a_duplicate() {
+        let mut env = valid_env();
+        env.remove("READER");
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("a missing var must still fail");
+        let messages = error_messages(&err);
+        assert_eq!(
+            messages.len(),
+            1,
+            "an absent var should not also be reported as a duplicate: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("READER"),
+            "error must name the missing var: {messages:?}"
+        );
+    }
+
     #[test]
     fn config_from_lookup_uses_testnet_defaults_and_token_file_fallback() {
         let env = valid_env();
@@ -983,6 +1201,8 @@ mod tests {
 
         assert_eq!(cfg.network, Network::Testnet);
         assert_eq!(cfg.stellar_rpc_url, TESTNET_RPC_URL);
+        // #1169 — pin the literal so the default can't regress to a non-RPC host.
+        assert_eq!(cfg.stellar_rpc_url, "https://soroban-testnet.stellar.org");
         assert_eq!(cfg.network_passphrase, TESTNET_PASSPHRASE);
         assert_eq!(
             cfg.price_loop_interval,
@@ -1264,5 +1484,37 @@ mod tests {
             "expected at least 2 errors, got {}",
             err.0.len()
         );
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_zero_set_prices_tx_fee() {
+        let mut env = valid_env();
+        env.insert("SET_PRICES_TX_FEE", "0".to_string());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+
+        assert!(matches!(
+            &err.0[0],
+            EnvError::InvalidVar {
+                var: "SET_PRICES_TX_FEE",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_zero_keeper_tx_fee() {
+        let mut env = valid_env();
+        env.insert("KEEPER_TX_FEE", "0".to_string());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+
+        assert!(matches!(
+            &err.0[0],
+            EnvError::InvalidVar {
+                var: "KEEPER_TX_FEE",
+                ..
+            }
+        ));
     }
 }

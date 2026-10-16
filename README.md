@@ -3,6 +3,7 @@
 Production Axum service for the SO4.market Soroban oracle and keeper.
 
 This repository contains a single Rust binary that runs:
+
 - Price fetching and aggregation from multiple sources (Binance, Coinbase, Pyth)
 - Keeper loop that executes pending orders, deposits, and withdrawals on-chain
 - HTTP API for price feeds and operational endpoints
@@ -19,6 +20,7 @@ so4-oracle  (single statically-deployed binary)
 │     GET /oracle/status               admin    last cycle, balance, per-token state
 │     GET /keeper/status               admin    pending work + last N executions
 │     GET /keeper/balance              admin    live keeper account XLM balance
+│     DELETE /keeper/blacklist/{key}   admin    clears a permanently-blacklisted order/deposit/withdrawal key
 │     GET /oracle/failed-submissions   admin    ring buffer of failures
 │     GET /metrics                     admin    Prometheus metrics
 ├── task: price_loop   tokio::interval(~1s)
@@ -87,6 +89,9 @@ KEEPER_LOOP_MS=1500
 
 # Price feed configuration (optional; falls back to embedded config/tokens.json)
 PRICE_FEED_CONFIG=/path/to/tokens.json
+
+# Pyth authentication (optional now, mandatory once Pyth enforces auth)
+# PYTH_API_KEY=<your-pyth-api-key>
 ```
 
 > **Note:** `NETWORK_PASSPHRASE` is not read by the binary — the correct
@@ -174,6 +179,16 @@ sudo systemctl enable oracle
 sudo systemctl start oracle
 ```
 
+The unit restarts on any exit with a 5-second delay, and systemd's start limit
+allows 50 restarts per 5 minutes — enough for a bad deploy or a transient boot
+dependency to self-heal. If the limit is ever exhausted (check with
+`systemctl status oracle`), clear it with:
+
+```bash
+sudo systemctl reset-failed oracle
+sudo systemctl start oracle
+```
+
 ### Fly.io
 
 ```bash
@@ -197,22 +212,24 @@ railway up
 
 ## Endpoints
 
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | No | Liveness check |
-| `/ready` | GET | No | Readiness check (RPC + keeper balance) |
-| `/prices` | GET | No | Current price feeds (CORS-enabled) |
-| `/oracle/status` | GET | Admin | Oracle status and recent errors |
-| `/keeper/status` | GET | Admin | Keeper status and execution history |
-| `/keeper/balance` | GET | Admin | Live keeper account XLM balance |
-| `/oracle/failed-submissions` | GET | Admin | Failed submission history |
-| `/metrics` | GET | Admin | Prometheus metrics |
+| Endpoint                     | Method | Auth  | Description                                                   |
+| ---------------------------- | ------ | ----- | ------------------------------------------------------------- |
+| `/health`                    | GET    | No    | Liveness check                                                |
+| `/ready`                     | GET    | No    | Readiness check (RPC + keeper balance)                        |
+| `/prices`                    | GET    | No    | Current price feeds (CORS-enabled)                            |
+| `/oracle/status`             | GET    | Admin | Oracle status and recent errors                               |
+| `/keeper/status`             | GET    | Admin | Keeper status and execution history                           |
+| `/keeper/balance`            | GET    | Admin | Live keeper account XLM balance                               |
+| `/keeper/blacklist/{key}`    | DELETE | Admin | Clears a permanently-blacklisted order/deposit/withdrawal key |
+| `/oracle/failed-submissions` | GET    | Admin | Failed submission history                                     |
+| `/metrics`                   | GET    | Admin | Prometheus metrics                                            |
 
 ## Observability
 
 Every request emits a structured JSON log carrying: `timestamp`, `level`, `method`, `route` (matched path, not raw URI), `status`, `latency_ms`, and `request_id`. An `x-request-id` header is accepted on inbound requests; if absent, a UUIDv4 is generated. The request ID is echoed in the response headers and included in all handler-internal log events.
 
 The following HTTP metrics are exposed at `/metrics`:
+
 - `oracle_http_requests_total{route,method,status_class}` (counter)
 - `oracle_http_request_duration_seconds_bucket{route,le}` (histogram)
 - `oracle_http_requests_in_flight` (gauge)

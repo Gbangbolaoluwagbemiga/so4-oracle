@@ -76,9 +76,26 @@ pub async fn oracle_status(
         .cloned()
         .collect();
 
+    // Check keeper balance using the same pattern as keeper_balance handler (#871).
+    let keeper_cfg = crate::keeper::KeeperBalanceConfig {
+        horizon_url: state.config.horizon_url.clone(),
+        account_id: state.config.keeper_account_id.clone(),
+        min_balance_xlm: state.config.min_keeper_balance_xlm,
+    };
+
+    let keeper_balance = crate::retry::retry_with_backoff(
+        || crate::keeper::check_keeper_balance(&keeper_cfg, &state.keeper_balance_below_min),
+        KEEPER_BALANCE_RETRY_ATTEMPTS,
+        KEEPER_BALANCE_RETRY_BASE_DELAY_MS,
+        crate::retry::MAX_BACKOFF_DELAY_MS,
+    )
+    .await
+    .ok()
+    .map(|stroops| stroops as f64 / crate::keeper::XLM_IN_STROOPS as f64);
+
     Json(OracleStatusResponse {
         last_cycle_time,
-        keeper_balance: None,
+        keeper_balance,
         prices,
         recent_errors,
     })
@@ -134,9 +151,10 @@ pub struct ClearBlacklistResponse {
 /// "manual intervention required" the blacklist log message promises
 /// actually possible through the API (#802).
 ///
-/// Also resets the key's consecutive freeze-failure count, so it gets a
-/// fresh `MAX_CONSECUTIVE_FREEZE_FAILURES` budget instead of being
-/// re-blacklisted after a single further failure.
+/// Also resets the key's consecutive freeze-failure count and execution-failure
+/// count, so it gets a fresh `MAX_CONSECUTIVE_FREEZE_FAILURES` and
+/// `MAX_CONSECUTIVE_EXECUTION_FAILURES` budget instead of being re-blacklisted
+/// after a single further failure (#887).
 pub async fn clear_blacklisted_key(
     _auth: AdminAuth,
     State(state): State<Arc<AppState>>,
@@ -154,6 +172,7 @@ pub async fn clear_blacklisted_key(
     }
 
     state.freeze_failure_counts.lock().await.remove(&key);
+    state.execution_failure_counts.lock().await.remove(&key);
 
     info!(key = %key, "blacklisted order key cleared via admin API");
     Ok(Json(ClearBlacklistResponse { key, cleared: true }))
@@ -192,7 +211,7 @@ pub async fn keeper_balance(
         || crate::keeper::check_keeper_balance(&keeper_cfg, &state.keeper_balance_below_min),
         KEEPER_BALANCE_RETRY_ATTEMPTS,
         KEEPER_BALANCE_RETRY_BASE_DELAY_MS,
-        30_000,
+        crate::retry::MAX_BACKOFF_DELAY_MS,
     )
     .await;
 
