@@ -73,19 +73,18 @@ where
 }
 
 /// Trait to determine if an error should be retried.
+///
+/// `is_retryable` is deliberately required, with no default and no impls for
+/// `String`/`&str` (#1227): a blanket "retry everything" default meant that
+/// deterministic failures (contract reverts, type mismatches, unparseable
+/// responses) were retried with backoff on every call, multiplying RPC load
+/// and log noise for errors that can never succeed. Every error type passed to
+/// [`retry_with_backoff`] must now say which of its variants are transient.
 pub trait Retryable {
     /// Returns true if this error represents a transient condition that may succeed on retry.
     /// Returns false for permanent failures like config errors or parse errors.
-    fn is_retryable(&self) -> bool {
-        true // Default: all errors are retryable
-    }
+    fn is_retryable(&self) -> bool;
 }
-
-// String errors are always retryable (legacy behavior)
-impl Retryable for String {}
-
-// str errors are always retryable (legacy behavior)
-impl Retryable for &str {}
 
 fn log_retry_failure<E: std::fmt::Debug>(
     attempt: u32,
@@ -112,6 +111,15 @@ async fn sleep_ms(ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test-only: these tests exercise the backoff schedule with plain `&str`
+    // errors, so treat them as transient here. Production code has no
+    // blanket impl and must classify its errors (#1227).
+    impl Retryable for &str {
+        fn is_retryable(&self) -> bool {
+            true
+        }
+    }
     use std::cell::Cell;
     use std::rc::Rc;
 
