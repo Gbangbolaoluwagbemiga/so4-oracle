@@ -195,20 +195,30 @@ sudo systemctl start oracle
 # Deploy to Fly.io
 fly deploy
 
-# Set secrets
-fly secrets set KEEPER_PRIVATE_KEY=<key>
-fly secrets set KEEPER_SECRET_KEY=<secret>
-fly secrets set KEEPER_ACCOUNT_ID=<account>
+# Set secrets (never in fly.toml: its [env] block is committed and shown by `fly config show`)
+fly secrets set KEEPER_PRIVATE_KEY=<hex> KEEPER_SECRET_KEY=<S...> ADMIN_API_TOKEN=<token>
+fly secrets set PYTH_API_KEY=<key>   # optional
 ```
+
+Non-secret settings (network, contract IDs, `KEEPER_ACCOUNT_ID`, loop
+intervals, fees) live in `fly.toml`'s `[env]`; edit the `YOUR_…` placeholders there.
 
 ### Railway
 
 ```bash
 # Deploy to Railway
 railway up
-
-# Set environment variables in Railway dashboard
 ```
+
+`railway.json` only carries non-secret variables. Add `KEEPER_PRIVATE_KEY`,
+`KEEPER_SECRET_KEY`, `ADMIN_API_TOKEN` (and optionally `PYTH_API_KEY`) in the
+Railway dashboard under the service's **Variables** tab, and mark each one
+**Sealed** so its value can't be viewed or exported afterwards. Never add them
+to `railway.json`, which is committed to the repo.
+
+> **Secrets never go in a tracked manifest (#1232).** CI's `manifest-secrets`
+> job fails if `KEEPER_PRIVATE_KEY`, `KEEPER_SECRET_KEY`, `ADMIN_API_TOKEN` or
+> `PYTH_API_KEY` is assigned in `fly.toml` or `railway.json`.
 
 ## Endpoints
 

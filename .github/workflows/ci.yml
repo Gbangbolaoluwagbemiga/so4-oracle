@@ -22,6 +22,15 @@ env:
 # point release break clippy with no code change, and leaves the declared MSRV
 # validated by nothing but `cargo check`.
 jobs:
+  # -- Deployment manifest secrets (#1232) -------------------------------
+  manifest-secrets:
+    name: No secrets in deploy manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: bash scripts/check-manifest-secrets.sh
+
   # -- MSRV enforcement ---------------------------------------------------
   msrv:
     name: MSRV check
