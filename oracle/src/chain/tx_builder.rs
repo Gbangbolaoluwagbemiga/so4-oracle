@@ -69,7 +69,15 @@ pub fn sign_transaction(
     secret_key: &str,
     network_passphrase: &str,
 ) -> Result<String, String> {
-    let key_bytes_raw = if secret_key.starts_with('S') {
+    let signing_key = signing_key_from_secret(secret_key)?;
+    sign_transaction_with_key(tx, &signing_key, network_passphrase)
+}
+
+/// Decode an S-strkey or 64-char hex secret into a `SigningKey` (#1226).
+/// Intermediate buffers are zeroised and `SigningKey` wipes itself on drop, so
+/// decode once at startup rather than per transaction.
+pub fn signing_key_from_secret(secret_key: &str) -> Result<ed25519_dalek::SigningKey, String> {
+    let key_bytes_raw = zeroize::Zeroizing::new(if secret_key.starts_with('S') {
         stellar_strkey::ed25519::PrivateKey::from_string(secret_key)
             .map_err(|e| format!("invalid secret strkey: {e}"))?
             .0
@@ -84,7 +92,7 @@ pub fn sign_transaction(
             "secret key must be an S-prefixed strkey or 64-char hex (got {} chars, non-hex or wrong prefix)",
             secret_key.len()
         ));
-    };
+    });
 
     if key_bytes_raw.len() != 32 {
         return Err(format!(
@@ -93,10 +101,17 @@ pub fn sign_transaction(
         ));
     }
 
-    let mut key_array = [0u8; 32];
+    let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
     key_array.copy_from_slice(&key_bytes_raw);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_array);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&key_array))
+}
 
+/// Sign `tx` with an already-decoded key (no per-call key decoding, #1226).
+pub fn sign_transaction_with_key(
+    tx: &Transaction,
+    signing_key: &ed25519_dalek::SigningKey,
+    network_passphrase: &str,
+) -> Result<String, String> {
     let network_id_hash = compute_network_id(network_passphrase);
 
     let payload = TransactionSignaturePayload {

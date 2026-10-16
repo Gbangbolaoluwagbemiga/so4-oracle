@@ -1166,6 +1166,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
